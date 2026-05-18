@@ -108,7 +108,20 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
             isError: true,
           };
         }
-        const content = atob(data.content.replace(/\n/g, ""));
+        // GitHub returns content as base64 with newlines every 60 chars.
+        // atob() gives back a "binary string" where each char's code point is
+        // a raw byte (0-255). For files with non-ASCII UTF-8 (em-dashes,
+        // arrows, unicode quotes, anything outside 7-bit ASCII), this binary
+        // string is NOT the original text — each UTF-8 byte becomes a separate
+        // character. Round-tripping this through JSON-RPC/SSE has been
+        // observed to cause the response stream to never reach the client,
+        // even though the Worker logs show the tool returning successfully.
+        //
+        // Fix: decode the base64 as bytes, then run a proper UTF-8 decode
+        // to produce a real JS string with one code point per Unicode char.
+        const stripped = data.content.replace(/\n/g, "");
+        const bytes = Uint8Array.from(atob(stripped), (c) => c.charCodeAt(0));
+        const content = new TextDecoder("utf-8").decode(bytes);
         return {
           content: [{ type: "text", text: content }],
         };
