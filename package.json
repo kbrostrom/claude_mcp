@@ -1,0 +1,25 @@
+{
+  "name": "github-mcp",
+  "version": "0.1.0",
+  "description": "Thin GitHub OAuth wrapper exposed as an MCP server on Cloudflare Workers",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.1.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "agents": "^0.0.50",
+    "hono": "^4.6.0",
+    "octokit": "^4.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.90.0"
+  }
+}
