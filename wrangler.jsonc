@@ -10,6 +10,12 @@
       "id": "6ac606546d6e4ecd822fc71aeedc47bd"
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "UPLOADS",
+      "bucket_name": "claude-mcp-uploads"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
@@ -28,6 +34,7 @@
     "enabled": true
   },
   "vars": {
-    "OAUTH_PROVIDER_NAME": "GitHub MCP"
+    "OAUTH_PROVIDER_NAME": "GitHub MCP",
+    "R2_BUCKET_NAME": "claude-mcp-uploads"
   }
 }
