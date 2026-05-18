@@ -6,10 +6,10 @@ export { GitHubMCP };
 
 export default new OAuthProvider({
   apiHandlers: {
-    "/mcp": GitHubMCP.serve("/mcp"),
-    "/sse": GitHubMCP.serveSSE("/sse"),
+    "/mcp": GitHubMCP.serve("/mcp") as never,
+    "/sse": GitHubMCP.serveSSE("/sse") as never,
   },
-  defaultHandler: githubHandler,
+  defaultHandler: githubHandler as never,
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/token",
   clientRegistrationEndpoint: "/register",

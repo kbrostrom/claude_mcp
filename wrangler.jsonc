@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "github-mcp",
+  "name": "claude-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -8,6 +8,20 @@
     {
       "binding": "OAUTH_KV",
       "id": "6ac606546d6e4ecd822fc71aeedc47bd"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "GitHubMCP"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GitHubMCP"]
     }
   ],
   "observability": {

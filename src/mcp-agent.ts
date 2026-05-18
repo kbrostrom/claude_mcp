@@ -4,6 +4,14 @@ import { Octokit } from "octokit";
 import { z } from "zod";
 import type { GitHubUserProps } from "./github-handler";
 
+interface Env {
+  OAUTH_KV: KVNamespace;
+  MCP_OBJECT: DurableObjectNamespace;
+  GITHUB_CLIENT_ID: string;
+  GITHUB_CLIENT_SECRET: string;
+  COOKIE_ENCRYPTION_KEY: string;
+}
+
 export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   server = new McpServer({
     name: "github-mcp",
@@ -20,13 +28,16 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
       "List repositories accessible to the authenticated user. Returns name, full_name, default_branch, and visibility.",
       {
         per_page: z.number().int().min(1).max(100).default(30),
-        sort: z.enum(["created", "updated", "pushed", "full_name"]).default("updated"),
+        sort: z
+          .enum(["created", "updated", "pushed", "full_name"])
+          .default("updated"),
       },
       async ({ per_page, sort }) => {
-        const { data } = await this.octokit.rest.repos.listForAuthenticatedUser({
-          per_page,
-          sort,
-        });
+        const { data } =
+          await this.octokit.rest.repos.listForAuthenticatedUser({
+            per_page,
+            sort,
+          });
         const repos = data.map((r) => ({
           name: r.name,
           full_name: r.full_name,
@@ -59,22 +70,14 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
         if (Array.isArray(data) || data.type !== "file") {
           return {
             content: [
-              {
-                type: "text",
-                text: `Path is not a file: ${path}`,
-              },
+              { type: "text", text: `Path is not a file: ${path}` },
             ],
             isError: true,
           };
         }
-        const content = Buffer.from(data.content, "base64").toString("utf-8");
+        const content = atob(data.content.replace(/\n/g, ""));
         return {
-          content: [
-            {
-              type: "text",
-              text: content,
-            },
-          ],
+          content: [{ type: "text", text: content }],
         };
       }
     );
@@ -146,10 +149,11 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
 
         const blobs = await Promise.all(
           files.map(async (file) => {
+            const encoded = btoa(unescape(encodeURIComponent(file.content)));
             const { data: blob } = await this.octokit.rest.git.createBlob({
               owner,
               repo,
-              content: Buffer.from(file.content, "utf-8").toString("base64"),
+              content: encoded,
               encoding: "base64",
             });
             return {
@@ -241,12 +245,11 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           repo,
           pull_number: pr_number,
         });
-        const { data: checks } =
-          await this.octokit.rest.checks.listForRef({
-            owner,
-            repo,
-            ref: pr.head.sha,
-          });
+        const { data: checks } = await this.octokit.rest.checks.listForRef({
+          owner,
+          repo,
+          ref: pr.head.sha,
+        });
         const summary = {
           number: pr.number,
           state: pr.state,
@@ -268,11 +271,4 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
       }
     );
   }
-}
-
-interface Env {
-  OAUTH_KV: KVNamespace;
-  GITHUB_CLIENT_ID: string;
-  GITHUB_CLIENT_SECRET: string;
-  COOKIE_ENCRYPTION_KEY: string;
 }
