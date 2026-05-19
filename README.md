@@ -6,7 +6,7 @@ A thin GitHub OAuth wrapper exposed as an MCP server on Cloudflare Workers. Lets
 
 - Acts as an OAuth 2.1 provider for claude.ai (handled by `@cloudflare/workers-oauth-provider`)
 - Delegates user authentication to GitHub via standard GitHub OAuth
-- Exposes nine MCP tools: `list_repos`, `read_file`, `create_branch`, `commit_files`, `open_pr`, `get_pr_status`, plus `get_upload_url` / `commit_from_blob` / `list_my_blobs` for large-file pushes
+- Exposes nine MCP tools: `list_repos`, `read_file`, `create_branch`, `commit_files`, `open_pr`, `get_pr_status`, plus `get_upload_url` / `commit_from_blob` / `list_my_blobs` for the upload flow (default for everything beyond trivially small generated content)
 
 ## One-time setup
 
@@ -35,7 +35,7 @@ npx wrangler kv:namespace create OAUTH_KV
 
 Copy the returned ID into `wrangler.jsonc` (replace `REPLACE_WITH_KV_NAMESPACE_ID`).
 
-### 4. Create the R2 bucket (for large-file uploads)
+### 4. Create the R2 bucket (for the upload flow)
 
 ```sh
 npx wrangler r2 bucket create claude-mcp-uploads
@@ -94,7 +94,7 @@ claude.ai  <-- OAuth 2.1 --> Worker (this) <-- OAuth + REST --> GitHub
                             Workers KV
                        (MCP token -> GH token)
 
-Large-file path:
+Upload flow (default for non-trivial content):
   Claude bash --PUT--> R2 <--read-- Worker --PUT--> GitHub
 ```
 
@@ -102,30 +102,43 @@ The worker is both an OAuth provider (to claude.ai) and an OAuth client (to GitH
 
 When Claude calls a tool, the worker looks up the GitHub token from the MCP token, instantiates Octokit, and calls the GitHub API.
 
-## Large-file uploads
+## Upload flow (default)
 
-The `commit_files` tool passes file content through Claude's tool-call arguments, which means the bytes are generated as tokens. For large files this is slow, expensive, and occasionally unreliable — long content can get truncated during generation.
+The `commit_files` tool passes file content through Claude's tool-call arguments, which means the bytes are generated as tokens. For anything beyond trivially small content this is slow, expensive, and occasionally unreliable — long content can get truncated during generation.
 
-For files larger than ~50KB (or really any file you want pushed verbatim with no rewriting risk), use the three-tool flow:
+The upload flow avoids that entirely. It's the default for both single- and multi-file commits:
 
 ```
 1. Claude calls: get_upload_url(filename: "index.html")
    → { blob_id: "a3f2…-index-html", upload_url: "https://…r2…?X-Amz-Signature=…" }
 
-2. Claude runs in bash:
+   Repeat once per file when committing multiple files.
+
+2. Claude runs in bash, once per file:
    curl -X PUT --data-binary @/path/to/index.html "<upload_url>"
 
 3. Claude calls: commit_from_blob(
      owner: "you", repo: "yourrepo", branch: "main",
-     path: "index.html", blob_id: "a3f2…-index-html",
-     message: "Update index.html"
+     blobs: [
+       { blob_id: "a3f2…-index-html", path: "index.html" },
+       { blob_id: "b4e1…-styles-css",  path: "styles.css"  },
+     ],
+     message: "Site update"
    )
-   → { commit_sha: "1fb3fb2…", commit_url: "https://github.com/…" }
+   → { status: "committed", commit_sha: "1fb3fb2…", commit_url: "https://github.com/…", files_committed: 2 }
 ```
 
-The bytes never pass through Claude's token generation. The Worker pulls from R2 server-to-server and pushes to GitHub via the same Git Data API as `commit_files`.
+All files in the `blobs` array land in a **single atomic commit**. The bytes never pass through Claude's token generation. The Worker pulls from R2 server-to-server and pushes to GitHub via the Git Data API (one blob per file, one tree, one commit, one ref update).
 
-Per-user scoping: blob keys are namespaced as `uploads/{github-login}/{blob_id}`, so each authenticated user only sees their own pending uploads via `list_my_blobs`. Presigned URLs use Worker-held R2 credentials, not the user's GitHub token.
+For a single-file commit, just pass a one-element `blobs` array. The legacy single-file shape (top-level `blob_id` + `path`) is still accepted as a compatibility shim, but `blobs` is the preferred and only documented form going forward.
+
+### When to still use `commit_files`
+
+`commit_files` remains in the toolset for one specific case: small content Claude is generating fresh in the conversation where the round-trip overhead of three tool calls isn't worth it. The skill description gives the rule of thumb. For everything else, the upload flow is the default.
+
+### Per-user scoping & cleanup
+
+Blob keys are namespaced as `uploads/{github-login}/{blob_id}`, so each authenticated user only sees their own pending uploads via `list_my_blobs`. Presigned URLs use Worker-held R2 credentials, not the user's GitHub token.
 
 Blobs are deleted automatically after a successful commit unless `delete_blob_after: false` is passed. Uncommitted blobs hang around indefinitely until the bucket's lifecycle rules age them out — see the next section.
 

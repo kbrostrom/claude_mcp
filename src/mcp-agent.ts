@@ -31,7 +31,7 @@ const BLOB_MAX_AGE_SECONDS = 24 * 3600;
 export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   server = new McpServer({
     name: "github-mcp",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   private get octokit() {
@@ -162,7 +162,7 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
 
     this.server.tool(
       "commit_files",
-      "Atomically commit one or more files to a branch. Creates a single commit containing all changes. For large files (>50KB), prefer get_upload_url + commit_from_blob — content here passes through Claude's token generation and can be truncated.",
+      "Atomically commit one or more files to a branch. Creates a single commit containing all changes. NOTE: content here passes through Claude's token generation and can be truncated for large files. Prefer commit_from_blob (with the upload flow) for anything beyond trivially small content.",
       {
         owner: z.string(),
         repo: z.string(),
@@ -324,17 +324,22 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
     // a single tool call's argument payload (truncation risk, base64 token
     // bloat):
     //
-    //   1. get_upload_url(filename?)          → presigned R2 PUT URL
-    //   2. curl -X PUT --data-binary @file …  (run from bash_tool)
-    //   3. commit_from_blob(repo, path, …)    → server-to-server R2 read + GitHub PUT
+    //   1. get_upload_url(filename?)              → presigned R2 PUT URL  (call N times for N files)
+    //   2. curl -X PUT --data-binary @file …      (run from bash_tool, once per file)
+    //   3. commit_from_blob(repo, blobs: […], …)  → server-to-server R2 read + GitHub PUT
     //
     // The bytes only ever cross the wire as raw HTTP body, never as generated
     // tokens. Bash → R2 directly; R2 → GitHub through this Worker.
+    //
+    // commit_from_blob now accepts an array of {blob_id, path} entries, so any
+    // number of files can land in a single atomic commit. The legacy single-file
+    // shape {blob_id, path} at the top level is still accepted for backwards
+    // compatibility — internally it is normalized to a 1-element array.
     // ====================================================================
 
     this.server.tool(
       "get_upload_url",
-      "Generate a presigned URL that Claude can curl a file to from bash. Returns {blob_id, upload_url, expires_in_seconds}. Pair with commit_from_blob to push the uploaded file to GitHub.",
+      "Generate a presigned URL that Claude can curl a file to from bash. Returns {blob_id, upload_url, expires_in_seconds}. Pair with commit_from_blob to push the uploaded file to GitHub. For multi-file atomic commits, call this once per file then pass all blob_ids to commit_from_blob.",
       {
         filename: z
           .string()
@@ -374,45 +379,117 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
       }
     );
 
+    // Schema for commit_from_blob:
+    //   Preferred shape:  { blobs: [{blob_id, path}, ...] }   — N files, one commit
+    //   Legacy shape:     { blob_id, path }                   — single file (compat)
+    //
+    // Zod's discriminated unions don't play nicely with the MCP schema
+    // serializer here, so we declare all the fields as optional and validate
+    // the combination in the handler. The tool description tells callers to
+    // use `blobs`.
     this.server.tool(
       "commit_from_blob",
-      "Commit a previously-uploaded blob to a GitHub repo. Use get_upload_url first to obtain blob_id, then upload via curl from bash, then call this. The Worker reads the blob from R2 and pushes it to GitHub server-to-server.",
+      "Commit one or more previously-uploaded blobs to a GitHub repo as a single atomic commit. Use get_upload_url N times first (once per file), upload each via curl from bash, then call this with `blobs: [{blob_id, path}, ...]`. The Worker reads each blob from R2 and writes them to GitHub server-to-server in one commit. The legacy single-file shape (top-level `blob_id` + `path`) is still accepted but `blobs` is preferred — multi-file atomic commits are the default flow.",
       {
         owner: z.string(),
         repo: z.string(),
         branch: z.string(),
-        path: z.string().describe("Destination path in the repo, e.g. 'src/foo.html'"),
-        blob_id: z.string().describe("Returned by get_upload_url"),
         message: z.string().describe("Git commit message"),
+        blobs: z
+          .array(
+            z.object({
+              blob_id: z.string().describe("Returned by get_upload_url"),
+              path: z.string().describe("Destination path in the repo, e.g. 'src/foo.html'"),
+            })
+          )
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Array of blobs to commit together. Preferred. Use this for both single- and multi-file commits."),
+        blob_id: z.string().optional().describe("Legacy single-file shape. Prefer `blobs` instead."),
+        path: z.string().optional().describe("Legacy single-file shape. Prefer `blobs` instead."),
         delete_blob_after: z
           .boolean()
           .default(true)
-          .describe("Delete the R2 blob once the commit succeeds. Defaults true; set false if you want to commit the same blob to multiple repos."),
+          .describe("Delete the R2 blobs once the commit succeeds. Defaults true; set false if you want to commit the same blobs to multiple repos."),
       },
-      async ({ owner, repo, branch, path, blob_id, message, delete_blob_after }) => {
-        // 1. Fetch the blob from R2 (server-to-server, no presign needed).
-        const r2Object = await this.env.UPLOADS.get(this.blobKey(blob_id));
-        if (!r2Object) {
-          return {
-            content: [
-              {
+      async ({ owner, repo, branch, message, blobs, blob_id, path, delete_blob_after }) => {
+        // ---- Normalize input into a single blobs[] array ----
+        let entries: Array<{ blob_id: string; path: string }>;
+        if (blobs && blobs.length > 0) {
+          if (blob_id || path) {
+            return {
+              content: [{
                 type: "text",
-                text: `No blob found for blob_id=${blob_id}. Did get_upload_url succeed, and did the curl upload return 200?`,
-              },
-            ],
+                text: "Pass either `blobs` (preferred) or the legacy top-level `blob_id`+`path` — not both.",
+              }],
+              isError: true,
+            };
+          }
+          entries = blobs;
+        } else if (blob_id && path) {
+          entries = [{ blob_id, path }];
+        } else {
+          return {
+            content: [{
+              type: "text",
+              text: "Missing required input. Provide either `blobs: [{blob_id, path}, ...]` (preferred) or top-level `blob_id` + `path` (legacy single-file shape).",
+            }],
             isError: true,
           };
         }
-        const fileBytes = await r2Object.arrayBuffer();
-        const fileSize = fileBytes.byteLength;
 
-        // 2. Base64-encode for the GitHub Git Data API.
-        //    We use createBlob with encoding: "base64" so binary files (PDFs,
-        //    images) round-trip correctly.
-        const base64Content = arrayBufferToBase64(fileBytes);
+        // Reject duplicate paths in one commit — GitHub's createTree would
+        // silently apply only the last one, which is almost never what the
+        // caller wanted and would silently lose data.
+        const seenPaths = new Set<string>();
+        for (const e of entries) {
+          if (seenPaths.has(e.path)) {
+            return {
+              content: [{
+                type: "text",
+                text: `Duplicate path "${e.path}" in blobs. Each path can only appear once per commit.`,
+              }],
+              isError: true,
+            };
+          }
+          seenPaths.add(e.path);
+        }
 
-        // 3. Standard create-blob → create-tree → create-commit → update-ref dance.
-        //    Same shape as the existing commit_files tool, just one file.
+        // ---- Fetch every blob from R2, fail fast if any is missing ----
+        // Fetch in parallel; if any returns null, abort before touching GitHub
+        // so we don't end up with a half-committed tree.
+        const fetched = await Promise.all(
+          entries.map(async (e) => {
+            const obj = await this.env.UPLOADS.get(this.blobKey(e.blob_id));
+            return { entry: e, obj };
+          })
+        );
+        const missing = fetched.filter((f) => !f.obj).map((f) => f.entry.blob_id);
+        if (missing.length > 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `No blob found for blob_id(s): ${missing.join(", ")}. Did get_upload_url succeed for each, and did each curl upload return 200?`,
+            }],
+            isError: true,
+          };
+        }
+
+        // ---- Read bytes and base64-encode ----
+        const fileData = await Promise.all(
+          fetched.map(async (f) => {
+            const buf = await f.obj!.arrayBuffer();
+            return {
+              entry: f.entry,
+              bytes: buf,
+              size: buf.byteLength,
+              base64: arrayBufferToBase64(buf),
+            };
+          })
+        );
+
+        // ---- Standard create-blob → create-tree → create-commit → update-ref ----
         const { data: ref } = await this.octokit.rest.git.getRef({
           owner,
           repo,
@@ -426,25 +503,30 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           commit_sha: parentSha,
         });
 
-        const { data: blob } = await this.octokit.rest.git.createBlob({
-          owner,
-          repo,
-          content: base64Content,
-          encoding: "base64",
-        });
+        // Create one Git blob per file (in parallel — independent API calls)
+        const treeEntries = await Promise.all(
+          fileData.map(async (fd) => {
+            const { data: gitBlob } = await this.octokit.rest.git.createBlob({
+              owner,
+              repo,
+              content: fd.base64,
+              encoding: "base64",
+            });
+            return {
+              path: fd.entry.path,
+              mode: "100644" as const,
+              type: "blob" as const,
+              sha: gitBlob.sha,
+            };
+          })
+        );
 
+        // One tree containing every entry; one commit on top of it.
         const { data: newTree } = await this.octokit.rest.git.createTree({
           owner,
           repo,
           base_tree: parentCommit.tree.sha,
-          tree: [
-            {
-              path,
-              mode: "100644",
-              type: "blob",
-              sha: blob.sha,
-            },
-          ],
+          tree: treeEntries,
         });
 
         const { data: newCommit } = await this.octokit.rest.git.createCommit({
@@ -462,28 +544,32 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           sha: newCommit.sha,
         });
 
-        // 4. Cleanup. Default to deleting since most blobs are one-shot.
+        // ---- Cleanup ----
+        // Delete blobs in parallel after successful commit. Failures here are
+        // non-fatal (orphans get caught by the R2 lifecycle rule eventually),
+        // so we don't surface them to the caller.
         if (delete_blob_after) {
-          await this.env.UPLOADS.delete(this.blobKey(blob_id));
+          await Promise.all(
+            entries.map((e) => this.env.UPLOADS.delete(this.blobKey(e.blob_id)))
+          );
         }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  status: "committed",
-                  commit_sha: newCommit.sha,
-                  commit_url: `https://github.com/${owner}/${repo}/commit/${newCommit.sha}`,
-                  file_size_bytes: fileSize,
-                  blob_deleted: delete_blob_after,
-                },
-                null,
-                2
-              ),
-            },
-          ],
+          content: [{
+            type: "text",
+            text: JSON.stringify(
+              {
+                status: "committed",
+                commit_sha: newCommit.sha,
+                commit_url: `https://github.com/${owner}/${repo}/commit/${newCommit.sha}`,
+                files_committed: entries.length,
+                files: fileData.map((fd) => ({ path: fd.entry.path, size_bytes: fd.size })),
+                blobs_deleted: delete_blob_after,
+              },
+              null,
+              2
+            ),
+          }],
         };
       }
     );
