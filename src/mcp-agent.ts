@@ -31,7 +31,7 @@ const BLOB_MAX_AGE_SECONDS = 24 * 3600;
 export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   server = new McpServer({
     name: "github-mcp",
-    version: "0.3.0",
+    version: "0.4.0",
   });
 
   private get octokit() {
@@ -313,6 +313,86 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           content: [
             { type: "text", text: JSON.stringify(summary, null, 2) },
           ],
+        };
+      }
+    );
+
+    this.server.tool(
+      "list_issues",
+      "List issues for a repository. Supports filtering by state, labels, and date. Use since to find issues created or updated after a specific date (ISO 8601). Returns issue number, title, body, state, labels, created_at, and updated_at.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        state: z
+          .enum(["open", "closed", "all"])
+          .default("all")
+          .describe("Filter by issue state"),
+        labels: z
+          .string()
+          .optional()
+          .describe("Comma-separated list of label names to filter by, e.g. 'deployment overview'"),
+        since: z
+          .string()
+          .optional()
+          .describe("Only return issues updated at or after this time (ISO 8601, e.g. '2026-04-06T00:00:00Z')"),
+        per_page: z.number().int().min(1).max(100).default(30),
+        page: z.number().int().min(1).default(1),
+      },
+      async ({ owner, repo, state, labels, since, per_page, page }) => {
+        const { data } = await this.octokit.rest.issues.listForRepo({
+          owner,
+          repo,
+          state,
+          labels,
+          since,
+          per_page,
+          page,
+        });
+        // Filter out pull requests (GitHub's issues API returns PRs too)
+        const issues = data
+          .filter((i) => !i.pull_request)
+          .map((i) => ({
+            number: i.number,
+            title: i.title,
+            state: i.state,
+            labels: i.labels.map((l) => (typeof l === "string" ? l : l.name)),
+            created_at: i.created_at,
+            updated_at: i.updated_at,
+            url: i.html_url,
+            body: i.body ?? "",
+          }));
+        return {
+          content: [{ type: "text", text: JSON.stringify(issues, null, 2) }],
+        };
+      }
+    );
+
+    this.server.tool(
+      "get_issue",
+      "Get the full details of a single issue by number, including its complete body text.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        issue_number: z.number().int(),
+      },
+      async ({ owner, repo, issue_number }) => {
+        const { data: issue } = await this.octokit.rest.issues.get({
+          owner,
+          repo,
+          issue_number,
+        });
+        const result = {
+          number: issue.number,
+          title: issue.title,
+          state: issue.state,
+          labels: issue.labels.map((l) => (typeof l === "string" ? l : l.name)),
+          created_at: issue.created_at,
+          updated_at: issue.updated_at,
+          url: issue.html_url,
+          body: issue.body ?? "",
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
       }
     );
