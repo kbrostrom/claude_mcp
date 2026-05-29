@@ -31,7 +31,7 @@ const BLOB_MAX_AGE_SECONDS = 24 * 3600;
 export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   server = new McpServer({
     name: "github-mcp",
-    version: "0.4.0",
+    version: "0.5.0",
   });
 
   private get octokit() {
@@ -58,17 +58,19 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   async init() {
     this.server.tool(
       "list_repos",
-      "List repositories accessible to the authenticated user. Returns name, full_name, default_branch, and visibility.",
+      "List repositories accessible to the authenticated user. Returns name, full_name, default_branch, and visibility. Use page to paginate if you have more than 100 repos.",
       {
-        per_page: z.number().int().min(1).max(100).default(30),
+        per_page: z.number().int().min(1).max(100).default(100),
+        page: z.number().int().min(1).default(1),
         sort: z
           .enum(["created", "updated", "pushed", "full_name"])
           .default("updated"),
       },
-      async ({ per_page, sort }) => {
+      async ({ per_page, page, sort }) => {
         const { data } =
           await this.octokit.rest.repos.listForAuthenticatedUser({
             per_page,
+            page,
             sort,
           });
         const repos = data.map((r) => ({
