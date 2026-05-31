@@ -6,7 +6,7 @@ A thin GitHub OAuth wrapper exposed as an MCP server on Cloudflare Workers. Lets
 
 - Acts as an OAuth 2.1 provider for claude.ai (handled by `@cloudflare/workers-oauth-provider`)
 - Delegates user authentication to GitHub via standard GitHub OAuth
-- Exposes nine MCP tools: `list_repos`, `read_file`, `create_branch`, `commit_files`, `open_pr`, `get_pr_status`, plus `get_upload_url` / `commit_from_blob` / `list_my_blobs` for the upload flow (default for everything beyond trivially small generated content)
+- Exposes ten MCP tools: `list_repos`, `create_repo`, `read_file`, `create_branch`, `commit_files`, `open_pr`, `get_pr_status`, plus `get_upload_url` / `commit_from_blob` / `list_my_blobs` for the upload flow (default for everything beyond trivially small generated content)
 
 ## One-time setup
 

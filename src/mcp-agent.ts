@@ -31,7 +31,7 @@ const BLOB_MAX_AGE_SECONDS = 24 * 3600;
 export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   server = new McpServer({
     name: "github-mcp",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   private get octokit() {
@@ -83,6 +83,155 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
         return {
           content: [{ type: "text", text: JSON.stringify(repos, null, 2) }],
         };
+      }
+    );
+
+    this.server.tool(
+      "create_repo",
+      "Create a new GitHub repository, either under the authenticated user's account or inside an organization. Pass `org` to create it in an organization (e.g. 'boodleai'); omit it to create a personal repo under the authenticated user. Defaults to private and to auto_init:true, which seeds an empty README so the repo has a committable default branch immediately — leave auto_init on unless you plan to push pre-existing history yourself. Returns full_name, html_url, default_branch, and clone_url.",
+      {
+        name: z.string().describe("Repository name, e.g. 'my-new-service'"),
+        org: z
+          .string()
+          .optional()
+          .describe(
+            "Organization login to create the repo under, e.g. 'boodleai'. Omit to create under the authenticated user."
+          ),
+        description: z.string().optional(),
+        private: z
+          .boolean()
+          .default(true)
+          .describe("Whether the repo is private. Defaults to true."),
+        auto_init: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Seed an empty README so the repo has a default branch that can be committed to right away. Set false only when pushing existing history."
+          ),
+        gitignore_template: z
+          .string()
+          .optional()
+          .describe(
+            "Name of a .gitignore template, e.g. 'Node', 'Python', 'Scala'. Only applied when auto_init is true."
+          ),
+        license_template: z
+          .string()
+          .optional()
+          .describe(
+            "SPDX license keyword, e.g. 'mit'. Only applied when auto_init is true."
+          ),
+        default_branch: z
+          .string()
+          .optional()
+          .describe(
+            "Rename the initial branch to this after creation, e.g. 'main'. Only takes effect when auto_init is true."
+          ),
+      },
+      async ({
+        name,
+        org,
+        description,
+        private: isPrivate,
+        auto_init,
+        gitignore_template,
+        license_template,
+        default_branch,
+      }) => {
+        try {
+          const { data: repo } = org
+            ? await this.octokit.rest.repos.createInOrg({
+                org,
+                name,
+                description,
+                private: isPrivate,
+                auto_init,
+                gitignore_template,
+                license_template,
+              })
+            : await this.octokit.rest.repos.createForAuthenticatedUser({
+                name,
+                description,
+                private: isPrivate,
+                auto_init,
+                gitignore_template,
+                license_template,
+              });
+
+          // GitHub names the initial branch per the account/org default (usually
+          // 'main'). Only rename when the caller asked for something different,
+          // and only when there's actually a branch to rename (auto_init).
+          let finalDefaultBranch = repo.default_branch;
+          if (
+            auto_init &&
+            default_branch &&
+            default_branch !== repo.default_branch
+          ) {
+            try {
+              await this.octokit.rest.repos.renameBranch({
+                owner: repo.owner.login,
+                repo: repo.name,
+                branch: repo.default_branch,
+                new_name: default_branch,
+              });
+              finalDefaultBranch = default_branch;
+            } catch {
+              // Non-fatal: the repo exists, only the rename failed. Report the
+              // branch GitHub actually created rather than failing the call.
+            }
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "created",
+                    full_name: repo.full_name,
+                    html_url: repo.html_url,
+                    private: repo.private,
+                    default_branch: finalDefaultBranch,
+                    clone_url: repo.clone_url,
+                    committable: auto_init,
+                    note: auto_init
+                      ? "Initialized with a README — commit_from_blob/commit_files can target the default branch right away."
+                      : "Empty repo with no branches yet. The commit tools need an existing ref, so create the first commit/branch before using them.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        } catch (err: unknown) {
+          const e = err as {
+            status?: number;
+            message?: string;
+            response?: { data?: { message?: string } };
+          };
+          const status = e?.status;
+          const ghMessage =
+            e?.response?.data?.message ?? e?.message ?? "unknown error";
+          let hint = "";
+          if (status === 422) {
+            hint =
+              " A repo with this name may already exist on that account/org, or the name is invalid.";
+          } else if (status === 403) {
+            hint =
+              " The OAuth grant may lack rights to create repos here, or the org restricts third-party OAuth apps — an org owner may need to approve the app.";
+          } else if (status === 404 && org) {
+            hint = ` Organization '${org}' not found, or you lack repo-creation rights in it.`;
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to create repo: ${ghMessage} (HTTP ${status ?? "?"}).${hint}`,
+              },
+            ],
+            isError: true,
+          };
+        }
       }
     );
 
