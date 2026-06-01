@@ -31,7 +31,7 @@ const BLOB_MAX_AGE_SECONDS = 24 * 3600;
 export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   server = new McpServer({
     name: "github-mcp",
-    version: "0.6.0",
+    version: "0.6.1",
   });
 
   private get octokit() {
