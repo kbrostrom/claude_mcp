@@ -31,7 +31,7 @@ const BLOB_MAX_AGE_SECONDS = 24 * 3600;
 export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
   server = new McpServer({
     name: "github-mcp",
-    version: "0.6.1",
+    version: "0.7.0",
   });
 
   private get octokit() {
@@ -259,17 +259,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
             isError: true,
           };
         }
-        // GitHub returns content as base64 with newlines every 60 chars.
-        // atob() gives back a "binary string" where each char's code point is
-        // a raw byte (0-255). For files with non-ASCII UTF-8 (em-dashes,
-        // arrows, unicode quotes, anything outside 7-bit ASCII), this binary
-        // string is NOT the original text — each UTF-8 byte becomes a separate
-        // character. Round-tripping this through JSON-RPC/SSE has been
-        // observed to cause the response stream to never reach the client,
-        // even though the Worker logs show the tool returning successfully.
-        //
-        // Fix: decode the base64 as bytes, then run a proper UTF-8 decode
-        // to produce a real JS string with one code point per Unicode char.
         const stripped = data.content.replace(/\n/g, "");
         const bytes = Uint8Array.from(atob(stripped), (c) => c.charCodeAt(0));
         const content = new TextDecoder("utf-8").decode(bytes);
@@ -469,8 +458,54 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
     );
 
     this.server.tool(
+      "list_milestones",
+      "List milestones for a repository. Returns each milestone's number, title, state, open/closed issue counts, and due date. Use the milestone number with list_issues to filter issues by milestone.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        state: z
+          .enum(["open", "closed", "all"])
+          .default("all")
+          .describe("Filter by milestone state"),
+        sort: z
+          .enum(["due_on", "completeness"])
+          .default("due_on")
+          .describe("Sort field"),
+        direction: z
+          .enum(["asc", "desc"])
+          .default("desc")
+          .describe("Sort direction"),
+        per_page: z.number().int().min(1).max(100).default(100),
+        page: z.number().int().min(1).default(1),
+      },
+      async ({ owner, repo, state, sort, direction, per_page, page }) => {
+        const { data } = await this.octokit.rest.issues.listMilestones({
+          owner,
+          repo,
+          state,
+          sort,
+          direction,
+          per_page,
+          page,
+        });
+        const milestones = data.map((m) => ({
+          number: m.number,
+          title: m.title,
+          state: m.state,
+          open_issues: m.open_issues,
+          closed_issues: m.closed_issues,
+          due_on: m.due_on,
+          description: m.description ?? "",
+        }));
+        return {
+          content: [{ type: "text", text: JSON.stringify(milestones, null, 2) }],
+        };
+      }
+    );
+
+    this.server.tool(
       "list_issues",
-      "List issues for a repository. Supports filtering by state, labels, and date. Use since to find issues created or updated after a specific date (ISO 8601). Returns issue number, title, body, state, labels, created_at, and updated_at.",
+      "List issues for a repository. Supports filtering by state, labels, milestone, and date. Pass milestone as a milestone number (from list_milestones) or the special values 'none' or '*'. Use since to find issues created or updated after a specific date (ISO 8601). Returns issue number, title, body, state, labels, milestone, created_at, and updated_at.",
       {
         owner: z.string(),
         repo: z.string(),
@@ -481,7 +516,11 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
         labels: z
           .string()
           .optional()
-          .describe("Comma-separated list of label names to filter by, e.g. 'deployment overview'"),
+          .describe("Comma-separated list of label names to filter by, e.g. 'bug,codetree-epic'"),
+        milestone: z
+          .string()
+          .optional()
+          .describe("Filter by milestone. Pass a milestone number (use list_milestones to look up the number by title), or '*' for any milestone, or 'none' for issues with no milestone."),
         since: z
           .string()
           .optional()
@@ -489,12 +528,13 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
         per_page: z.number().int().min(1).max(100).default(30),
         page: z.number().int().min(1).default(1),
       },
-      async ({ owner, repo, state, labels, since, per_page, page }) => {
+      async ({ owner, repo, state, labels, milestone, since, per_page, page }) => {
         const { data } = await this.octokit.rest.issues.listForRepo({
           owner,
           repo,
           state,
           labels,
+          milestone,
           since,
           per_page,
           page,
@@ -507,6 +547,7 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
             title: i.title,
             state: i.state,
             labels: i.labels.map((l) => (typeof l === "string" ? l : l.name)),
+            milestone: i.milestone ? { number: i.milestone.number, title: i.milestone.title } : null,
             created_at: i.created_at,
             updated_at: i.updated_at,
             url: i.html_url,
@@ -537,6 +578,7 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           title: issue.title,
           state: issue.state,
           labels: issue.labels.map((l) => (typeof l === "string" ? l : l.name)),
+          milestone: issue.milestone ? { number: issue.milestone.number, title: issue.milestone.title } : null,
           created_at: issue.created_at,
           updated_at: issue.updated_at,
           url: issue.html_url,
@@ -550,22 +592,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
 
     // ====================================================================
     // Large-file upload flow
-    //
-    // Three-step pattern for pushing files Claude can't reliably pass through
-    // a single tool call's argument payload (truncation risk, base64 token
-    // bloat):
-    //
-    //   1. get_upload_url(filename?)              → presigned R2 PUT URL  (call N times for N files)
-    //   2. curl -X PUT --data-binary @file …      (run from bash_tool, once per file)
-    //   3. commit_from_blob(repo, blobs: […], …)  → server-to-server R2 read + GitHub PUT
-    //
-    // The bytes only ever cross the wire as raw HTTP body, never as generated
-    // tokens. Bash → R2 directly; R2 → GitHub through this Worker.
-    //
-    // commit_from_blob now accepts an array of {blob_id, path} entries, so any
-    // number of files can land in a single atomic commit. The legacy single-file
-    // shape {blob_id, path} at the top level is still accepted for backwards
-    // compatibility — internally it is normalized to a 1-element array.
     // ====================================================================
 
     this.server.tool(
@@ -610,14 +636,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
       }
     );
 
-    // Schema for commit_from_blob:
-    //   Preferred shape:  { blobs: [{blob_id, path}, ...] }   — N files, one commit
-    //   Legacy shape:     { blob_id, path }                   — single file (compat)
-    //
-    // Zod's discriminated unions don't play nicely with the MCP schema
-    // serializer here, so we declare all the fields as optional and validate
-    // the combination in the handler. The tool description tells callers to
-    // use `blobs`.
     this.server.tool(
       "commit_from_blob",
       "Commit one or more previously-uploaded blobs to a GitHub repo as a single atomic commit. Use get_upload_url N times first (once per file), upload each via curl from bash, then call this with `blobs: [{blob_id, path}, ...]`. The Worker reads each blob from R2 and writes them to GitHub server-to-server in one commit. The legacy single-file shape (top-level `blob_id` + `path`) is still accepted but `blobs` is preferred — multi-file atomic commits are the default flow.",
@@ -670,9 +688,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           };
         }
 
-        // Reject duplicate paths in one commit — GitHub's createTree would
-        // silently apply only the last one, which is almost never what the
-        // caller wanted and would silently lose data.
         const seenPaths = new Set<string>();
         for (const e of entries) {
           if (seenPaths.has(e.path)) {
@@ -687,9 +702,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           seenPaths.add(e.path);
         }
 
-        // ---- Fetch every blob from R2, fail fast if any is missing ----
-        // Fetch in parallel; if any returns null, abort before touching GitHub
-        // so we don't end up with a half-committed tree.
         const fetched = await Promise.all(
           entries.map(async (e) => {
             const obj = await this.env.UPLOADS.get(this.blobKey(e.blob_id));
@@ -707,7 +719,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           };
         }
 
-        // ---- Read bytes and base64-encode ----
         const fileData = await Promise.all(
           fetched.map(async (f) => {
             const buf = await f.obj!.arrayBuffer();
@@ -720,7 +731,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           })
         );
 
-        // ---- Standard create-blob → create-tree → create-commit → update-ref ----
         const { data: ref } = await this.octokit.rest.git.getRef({
           owner,
           repo,
@@ -734,7 +744,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           commit_sha: parentSha,
         });
 
-        // Create one Git blob per file (in parallel — independent API calls)
         const treeEntries = await Promise.all(
           fileData.map(async (fd) => {
             const { data: gitBlob } = await this.octokit.rest.git.createBlob({
@@ -752,7 +761,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           })
         );
 
-        // One tree containing every entry; one commit on top of it.
         const { data: newTree } = await this.octokit.rest.git.createTree({
           owner,
           repo,
@@ -775,10 +783,6 @@ export class GitHubMCP extends McpAgent<Env, unknown, GitHubUserProps> {
           sha: newCommit.sha,
         });
 
-        // ---- Cleanup ----
-        // Delete blobs in parallel after successful commit. Failures here are
-        // non-fatal (orphans get caught by the R2 lifecycle rule eventually),
-        // so we don't surface them to the caller.
         if (delete_blob_after) {
           await Promise.all(
             entries.map((e) => this.env.UPLOADS.delete(this.blobKey(e.blob_id)))
